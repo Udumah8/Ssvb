@@ -1,25 +1,32 @@
 /**
  * SVBB Telegram Bot
  * 
- * A Telegram bot for managing campaigns and receiving notifications
+ * Production-ready Telegram bot for managing campaigns and notifications
  * 
  * Commands:
- * /start - Start the bot
+ * /start - Start the bot and subscribe to notifications
  * /stop - Stop receiving notifications
- * /status - Get bot status
+ * /status - Get bot and campaign status
  * /help - Show help message
- * /campaigns - List active campaigns
+ * /campaigns - List all campaigns
  * /campaign <id> - Get campaign details
+ * /wallets - List all wallets
  */
 
-import { 
-  getCampaign, 
-  getAllCampaigns 
+import {
+  getCampaign,
+  getAllCampaigns,
+  startCampaign,
+  stopCampaign,
+  pauseCampaign,
+  resumeCampaign
 } from '../lib/campaign';
-import { 
-  getAllWallets, 
-  generateKeypair 
+import {
+  getAllWallets,
+  getBurnerWalletsByStatus,
+  createBurnerWallet
 } from '../lib/wallet';
+import type { Campaign, CampaignStrategy, WalletStatus } from '../src/types';
 
 interface TelegramUpdate {
   update_id: number;
@@ -56,10 +63,12 @@ interface TelegramUpdate {
 
 interface TelegramBotConfig {
   token: string;
-  chatId?: number;
+  allowedChatIds?: number[];
   notificationSettings: {
     campaignStarted: boolean;
     campaignStopped: boolean;
+    campaignPaused: boolean;
+    campaignResumed: boolean;
     campaignError: boolean;
     walletFunded: boolean;
     dailyReport: boolean;
@@ -68,39 +77,39 @@ interface TelegramBotConfig {
 
 class TelegramBot {
   private token: string;
-  private chatId?: number;
-  private campaignManager: CampaignManager;
-  private walletManager: WalletManager;
+  private allowedChatIds: Set<number>;
   private config: TelegramBotConfig;
   private isRunning: boolean = false;
   private subscribedChats: Set<number> = new Set();
+  private pollingOffset: number = 0;
 
   constructor(config: TelegramBotConfig) {
     this.token = config.token;
-    this.chatId = config.chatId;
+    this.allowedChatIds = new Set(config.allowedChatIds || []);
     this.config = config;
-    this.campaignManager = new CampaignManager();
-    this.walletManager = new WalletManager();
   }
 
   /**
-   * Start the bot
+   * Start the bot - long polling for updates
    */
   async start(): Promise<void> {
     console.log('🤖 Starting SVBB Telegram Bot...');
-    this.isRunning = true;
     
-    // Verify bot token by getting bot info
+    // Verify bot token
     try {
       const botInfo = await this.apiCall('getMe', {});
-      console.log(`✅ Bot logged in as: @${(botInfo as any).result.username}`);
+      const username = (botInfo as any).result.username;
+      console.log(`✅ Bot logged in as: @${username}`);
     } catch (error) {
       console.error('❌ Failed to verify bot token:', error);
       return;
     }
     
-    console.log('✅ Telegram Bot started successfully!');
-    console.log('\n📱 Send /start to the bot to enable notifications.');
+    this.isRunning = true;
+    console.log('✅ Telegram Bot started! Send /start to enable notifications.');
+    
+    // Start polling
+    this.poll();
   }
 
   /**
@@ -112,6 +121,40 @@ class TelegramBot {
   }
 
   /**
+   * Long polling loop
+   */
+  private async poll(): Promise<void> {
+    while (this.isRunning) {
+      try {
+        const updates = await this.getUpdates();
+        for (const update of updates) {
+          await this.handleUpdate(update);
+          this.pollingOffset = update.update_id + 1;
+        }
+      } catch (error) {
+        console.error('Polling error:', error);
+        await this.sleep(5000); // Wait 5 seconds before retry
+      }
+    }
+  }
+
+  /**
+   * Get updates from Telegram
+   */
+  private async getUpdates(): Promise<TelegramUpdate[]> {
+    try {
+      const response = await this.apiCall('getUpdates', {
+        offset: this.pollingOffset,
+        timeout: 30,
+        limit: 100
+      });
+      return (response as any).result || [];
+    } catch {
+      return [];
+    }
+  }
+
+  /**
    * Handle incoming updates
    */
   async handleUpdate(update: TelegramUpdate): Promise<void> {
@@ -119,8 +162,6 @@ class TelegramBot {
 
     if (update.message) {
       await this.handleMessage(update.message);
-    } else if (update.callback_query) {
-      await this.handleCallbackQuery(update.callback_query);
     }
   }
 
@@ -136,10 +177,15 @@ class TelegramBot {
 
     console.log(`📩 Message from ${user?.first_name} (${chatId}): ${text}`);
 
-    // Remove leading slash
-    const command = text.startsWith('/') ? text.slice(1) : text;
+    // Check if chat is allowed (if restrictions are set)
+    if (this.allowedChatIds.size > 0 && !this.allowedChatIds.has(chatId)) {
+      console.log(`⚠️ Unauthorized access attempt from chat ${chatId}`);
+      return;
+    }
+
+    const command = text.startsWith('/') ? text.slice(1).toLowerCase() : text.toLowerCase();
     const parts = command.split(' ');
-    const cmd = parts[0].toLowerCase();
+    const cmd = parts[0];
     const args = parts.slice(1);
 
     switch (cmd) {
@@ -161,6 +207,12 @@ class TelegramBot {
       case 'campaign':
         await this.handleCampaignDetails(chatId, args[0]);
         break;
+      case 'wallets':
+        await this.handleListWallets(chatId);
+        break;
+      case 'wallet':
+        await this.handleWalletDetails(chatId, args[0]);
+        break;
       default:
         await this.sendMessage(chatId, `Unknown command: /${cmd}\nUse /help for available commands.`);
     }
@@ -172,30 +224,23 @@ class TelegramBot {
   async handleStart(chatId: number, firstName: string): Promise<void> {
     this.subscribedChats.add(chatId);
     
-    const welcomeMessage = `
-👋 *Welcome to SVBB Bot, ${firstName}!*
+    const welcomeMessage = `👋 *Welcome to SVBB Bot, ${firstName}!*
 
 I'll help you monitor your volume campaigns and send notifications.
 
 *Available Commands:*
 
 /start - Start receiving notifications
-/stop - Stop receiving notifications
-/status - Check bot status
+/stop - Unsubscribe from notifications  
+/status - Check bot and campaign status
 /help - Show this help message
 /campaigns - List all campaigns
 /campaign <id> - Get campaign details
+/wallets - List all wallets
 
-*Notification Settings:*
-- Campaign started/stopped
-- Campaign errors
-- Wallet funded
-- Daily reports
+You're now subscribed to campaign notifications! ✅`;
 
-You're now subscribed to campaign notifications! ✅
-    `.trim();
-
-    await this.sendMessage(chatId, welcomeMessage, { parse_mode: 'Markdown' });
+    await this.sendMessage(chatId, welcomeMessage);
   }
 
   /**
@@ -210,84 +255,102 @@ You're now subscribed to campaign notifications! ✅
    * Handle /status command
    */
   async handleStatus(chatId: number): Promise<void> {
-    const status = {
-      bot: this.isRunning ? '🟢 Running' : '🔴 Stopped',
-      subscribers: this.subscribedChats.size,
-      notifications: this.config.notificationSettings
-    };
+    const campaigns = getAllCampaigns();
+    const activeCampaigns = campaigns.filter(c => c.status === 'running').length;
+    const totalVolume = campaigns.reduce((sum, c) => sum + c.metrics.volume, 0);
+    const wallets = getAllWallets();
+    const activeWallets = wallets.filter(w => w.status === 'active').length;
 
-    const statusMessage = `
-*🤖 Bot Status:*
+    const statusMessage = `*🤖 Bot Status:*
 
-Status: ${status.bot}
-Active Subscribers: ${status.subscribers}
+*Status:* ${this.isRunning ? '🟢 Running' : '🔴 Stopped'}
+*Subscribers:* ${this.subscribedChats.size}
 
-*Notification Settings:*
-- Campaign Started: ${status.notifications.campaignStarted ? '✅' : '❌'}
-- Campaign Stopped: ${status.notifications.campaignStopped ? '✅' : '❌'}
-- Campaign Errors: ${status.notifications.campaignError ? '✅' : '❌'}
-- Wallet Funded: ${status.notifications.walletFunded ? '✅' : '❌'}
-- Daily Report: ${status.notifications.dailyReport ? '✅' : '❌'}
-    `.trim();
+*📊 Campaign Stats:*
+- Total Campaigns: ${campaigns.length}
+- Active: ${activeCampaigns}
+- Total Volume: ${totalVolume.toFixed(2)} SOL
 
-    await this.sendMessage(chatId, statusMessage, { parse_mode: 'Markdown' });
+*💰 Wallet Stats:*
+- Total Wallets: ${wallets.length}
+- Active: ${activeWallets}
+
+*⚙️ Notification Settings:*
+- Campaign Started: ${this.config.notificationSettings.campaignStarted ? '✅' : '❌'}
+- Campaign Stopped: ${this.config.notificationSettings.campaignStopped ? '✅' : '❌'}
+- Campaign Paused: ${this.config.notificationSettings.campaignPaused ? '✅' : '❌'}
+- Campaign Resumed: ${this.config.notificationSettings.campaignResumed ? '✅' : '❌'}
+- Campaign Errors: ${this.config.notificationSettings.campaignError ? '✅' : '❌'}`;
+
+    await this.sendMessage(chatId, statusMessage);
   }
 
   /**
    * Handle /help command
    */
   async handleHelp(chatId: number): Promise<void> {
-    const helpMessage = `
-*📖 SVBB Bot Help*
+    const helpMessage = `*📖 SVBB Bot Help*
 
 *Commands:*
 
 /start - Subscribe to notifications
 /stop - Unsubscribe from notifications
-/status - Check bot and notification status
+/status - Check bot and campaign status
 /help - Show this help message
 
 *Campaign Management:*
 /campaigns - List all campaigns
 /campaign <id> - Show campaign details
 
+*Wallet Management:*
+/wallets - List all wallets
+/wallet <id> - Show wallet details
+
 *Examples:*
 /campaigns
-/campaign campaign_123
+/campaign abc123
+/wallets`;
 
-*Support:*
-For more help, visit our documentation.
-    `.trim();
-
-    await this.sendMessage(chatId, helpMessage, { parse_mode: 'Markdown' });
+    await this.sendMessage(chatId, helpMessage);
   }
 
   /**
    * Handle /campaigns command
    */
   async handleListCampaigns(chatId: number): Promise<void> {
-    // Mock campaigns data
-    const campaigns = [
-      { id: 'campaign_001', name: 'JUP Campaign', status: 'active', volume: 125.5 },
-      { id: 'campaign_002', name: 'USDC Campaign', status: 'paused', volume: 45.2 },
-      { id: 'campaign_003', name: 'mSOL Campaign', status: 'stopped', volume: 210.8 }
-    ];
+    const campaigns = getAllCampaigns();
+    
+    if (campaigns.length === 0) {
+      await this.sendMessage(chatId, 'No campaigns found. Create one using the CLI or web dashboard.');
+      return;
+    }
 
-    let message = '*📊 Active Campaigns:*\n\n';
+    let message = '*📊 Campaigns:*\n\n';
 
     campaigns.forEach(c => {
-      const statusEmoji = c.status === 'active' ? '🟢' : c.status === 'paused' ? '🟡' : '🔴';
+      const statusEmoji = c.status === 'running' ? '🟢' : 
+                          c.status === 'paused' ? '🟡' : 
+                          c.status === 'stopped' ? '🔴' : '⚪';
+      const buyCount = c.metrics.buyCount;
+      const sellCount = c.metrics.sellCount;
+      const total = buyCount + sellCount;
+      const buyRatio = total > 0 ? ((buyCount / total) * 100).toFixed(0) : 0;
+      
       message += `${statusEmoji} *${c.name}*\n`;
       message += `   ID: \`${c.id}\`\n`;
+      message += `   Strategy: ${c.strategy}\n`;
       message += `   Status: ${c.status}\n`;
-      message += `   Volume: ${c.volume} SOL\n\n`;
+      message += `   Volume: ${c.metrics.volume.toFixed(2)} SOL\n`;
+      message += `   Transactions: ${c.metrics.transactionCount}\n`;
+      message += `   Buy/Sell: ${buyRatio}% / ${(100 - parseInt(buyRatio)).toFixed(0)}%\n`;
+      message += `   Spent: ${c.budget.spent.toFixed(2)} / ${c.budget.total} SOL\n\n`;
     });
 
-    await this.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+    await this.sendMessage(chatId, message);
   }
 
   /**
-   * Handle /campaign command
+   * Handle /campaign <id> command
    */
   async handleCampaignDetails(chatId: number, campaignId?: string): Promise<void> {
     if (!campaignId) {
@@ -295,71 +358,117 @@ For more help, visit our documentation.
       return;
     }
 
-    // Mock campaign details
-    const campaign = {
-      id: campaignId,
-      name: 'JUP Campaign',
-      token: 'JUPyiwrYJFskUPiHa7hkeR8VUtkqjberbSOWd91pbT2a',
-      status: 'active',
-      strategy: 'drip',
-      budget: 10,
-      spent: 8.5,
-      volume: 125.5,
-      transactions: 342,
-      makers: 15,
-      buyRatio: 0.62,
-      startedAt: new Date(Date.now() - 86400000).toISOString()
-    };
+    const campaign = getCampaign(campaignId);
+    
+    if (!campaign) {
+      await this.sendMessage(chatId, `Campaign not found: ${campaignId}`);
+      return;
+    }
 
-    const details = `
-*📈 Campaign: ${campaign.name}*
+    const buyCount = campaign.metrics.buyCount;
+    const sellCount = campaign.metrics.sellCount;
+    const total = buyCount + sellCount;
+    const buyRatio = total > 0 ? ((buyCount / total) * 100).toFixed(0) : 0;
 
-ID: \`${campaign.id}\`
-Token: \`${campaign.token.substring(0, 20)}...\`
-Status: ${campaign.status.toUpperCase()}
-Strategy: ${campaign.strategy}
+    const details = `*📈 Campaign: ${campaign.name}*
 
-*Stats:*
-💰 Budget: ${campaign.budget} SOL
-💸 Spent: ${campaign.spent} SOL
-📊 Volume: ${campaign.volume} SOL
-🔢 Transactions: ${campaign.transactions}
-👥 Active Makers: ${campaign.makers}
-📈 Buy Ratio: ${(campaign.buyRatio * 100).toFixed(0)}%
+*ID:* \`${campaign.id}\`
+*Token:* \`${campaign.tokenMint}\`
+*Strategy:* ${campaign.strategy}
+*Status:* ${campaign.status.toUpperCase()}
 
-*Timeline:*
-Started: ${new Date(campaign.startedAt).toLocaleString()}
-    `.trim();
+*💰 Budget:*
+- Total: ${campaign.budget.total} SOL
+- Daily: ${campaign.budget.daily} SOL
+- Spent: ${campaign.budget.spent.toFixed(2)} SOL
+- Remaining: ${(campaign.budget.total - campaign.budget.spent).toFixed(2)} SOL
 
-    await this.sendMessage(chatId, details, { parse_mode: 'Markdown' });
+*📊 Metrics:*
+- Volume: ${campaign.metrics.volume.toFixed(4)} SOL
+- Transactions: ${campaign.metrics.transactionCount}
+- Active Makers: ${campaign.metrics.makerCount}
+- Buy: ${buyCount} (${buyRatio}%)
+- Sell: ${sellCount} (${(100 - parseInt(buyRatio)).toFixed(0)}%)
+- Total Fees: ${campaign.metrics.totalFees.toFixed(6)} SOL
+- Avg Price Impact: ${campaign.metrics.averagePriceImpact.toFixed(2)}%
+
+*⏰ Timeline:*
+- Created: ${campaign.createdAt?.toISOString() || 'N/A'}
+- Started: ${campaign.startedAt?.toISOString() || 'N/A'}
+- Updated: ${campaign.updatedAt?.toISOString() || 'N/A'}`;
+
+    await this.sendMessage(chatId, details);
   }
 
   /**
-   * Handle callback queries (inline keyboard buttons)
+   * Handle /wallets command
    */
-  async handleCallbackQuery(callback: TelegramUpdate['callback_query']): Promise<void> {
-    if (!callback) return;
-
-    const chatId = callback.message.chat.id;
-    const data = callback.data;
-
-    // Handle button callbacks
-    if (data === 'refresh_status') {
-      await this.handleStatus(chatId);
-    } else if (data === 'list_campaigns') {
-      await this.handleListCampaigns(chatId);
+  async handleListWallets(chatId: number): Promise<void> {
+    const wallets = getAllWallets();
+    
+    if (wallets.length === 0) {
+      await this.sendMessage(chatId, 'No wallets found.');
+      return;
     }
+
+    const activeWallets = wallets.filter(w => w.status === 'active');
+    const coolingWallets = wallets.filter(w => w.status === 'cooling');
+    const pausedWallets = wallets.filter(w => w.status === 'paused');
+
+    let message = `*💼 Wallets:*\n\n`;
+    message += `*Total:* ${wallets.length}\n`;
+    message += `*Active:* ${activeWallets.length}\n`;
+    message += `*Cooling:* ${coolingWallets.length}\n`;
+    message += `*Paused:* ${pausedWallets.length}\n\n`;
+
+    if (wallets.length <= 20) {
+      message += '*Recent Wallets:*\n';
+      wallets.slice(0, 10).forEach(w => {
+        const statusEmoji = w.status === 'active' ? '🟢' : 
+                            w.status === 'cooling' ? '🟡' : '🔴';
+        message += `${statusEmoji} \`${w.address.slice(0, 20)}...\` - ${w.balance.toFixed(4)} SOL\n`;
+      });
+    }
+
+    await this.sendMessage(chatId, message);
+  }
+
+  /**
+   * Handle /wallet <id> command
+   */
+  async handleWalletDetails(chatId: number, walletId?: string): Promise<void> {
+    if (!walletId) {
+      await this.sendMessage(chatId, 'Please provide a wallet ID or address.\nUsage: /wallet <id_or_address>');
+      return;
+    }
+
+    const wallets = getAllWallets();
+    const wallet = wallets.find(w => w.id === walletId || w.address === walletId);
+    
+    if (!wallet) {
+      await this.sendMessage(chatId, `Wallet not found: ${walletId}`);
+      return;
+    }
+
+    const details = `*💰 Wallet Details:*
+
+*ID:* \`${wallet.id}\`
+*Address:* \`${wallet.address}\`
+*Status:* ${wallet.status.toUpperCase()}
+*Balance:* ${wallet.balance.toFixed(4)} SOL`;
+
+    await this.sendMessage(chatId, details);
   }
 
   /**
    * Send a message to a chat
    */
-  async sendMessage(chatId: number, text: string, options?: { parse_mode?: string }): Promise<void> {
+  async sendMessage(chatId: number, text: string): Promise<void> {
     try {
       await this.apiCall('sendMessage', {
         chat_id: chatId,
         text,
-        parse_mode: options?.parse_mode || 'Markdown'
+        parse_mode: 'Markdown'
       });
     } catch (error) {
       console.error('Failed to send message:', error);
@@ -369,89 +478,82 @@ Started: ${new Date(campaign.startedAt).toLocaleString()}
   /**
    * Broadcast a message to all subscribed chats
    */
-  async broadcast(text: string, options?: { parse_mode?: string }): Promise<void> {
+  async broadcast(text: string): Promise<void> {
     for (const chatId of this.subscribedChats) {
-      await this.sendMessage(chatId, text, options);
+      await this.sendMessage(chatId, text);
     }
   }
 
   /**
-   * Send campaign notification
+   * Notification methods for campaign events
    */
-  async notifyCampaignStarted(campaignId: string, campaignName: string): Promise<void> {
+  async notifyCampaignStarted(campaignId: string): Promise<void> {
     if (!this.config.notificationSettings.campaignStarted) return;
+    
+    const campaign = getCampaign(campaignId);
+    if (!campaign) return;
 
-    const message = `
-🟢 *Campaign Started*
+    const message = `🟢 *Campaign Started*
 
-*${campaignName}* is now running!
+*${campaign.name}* is now running!
 
-Campaign ID: \`${campaignId}\`
-    `.trim();
+*Strategy:* ${campaign.strategy}
+*Budget:* ${campaign.budget.total} SOL`;
 
     await this.broadcast(message);
   }
 
-  /**
-   * Send campaign stopped notification
-   */
-  async notifyCampaignStopped(campaignId: string, campaignName: string): Promise<void> {
+  async notifyCampaignStopped(campaignId: string): Promise<void> {
     if (!this.config.notificationSettings.campaignStopped) return;
+    
+    const campaign = getCampaign(campaignId);
+    if (!campaign) return;
 
-    const message = `
-🔴 *Campaign Stopped*
+    const message = `🔴 *Campaign Stopped*
 
-*${campaignName}* has been stopped.
+*${campaign.name}* has been stopped.
 
-Campaign ID: \`${campaignId}\`
-    `.trim();
+*Final Volume:* ${campaign.metrics.volume.toFixed(2)} SOL
+*Transactions:* ${campaign.metrics.transactionCount}`;
 
     await this.broadcast(message);
   }
 
-  /**
-   * Send error notification
-   */
+  async notifyCampaignPaused(campaignId: string): Promise<void> {
+    if (!this.config.notificationSettings.campaignPaused) return;
+    
+    const campaign = getCampaign(campaignId);
+    if (!campaign) return;
+
+    const message = `⏸️ *Campaign Paused*
+
+*${campaign.name}* has been paused.
+
+*Current Volume:* ${campaign.metrics.volume.toFixed(2)} SOL`;
+
+    await this.broadcast(message);
+  }
+
+  async notifyCampaignResumed(campaignId: string): Promise<void> {
+    if (!this.config.notificationSettings.campaignResumed) return;
+    
+    const campaign = getCampaign(campaignId);
+    if (!campaign) return;
+
+    const message = `▶️ *Campaign Resumed*
+
+*${campaign.name}* has been resumed.`;
+
+    await this.broadcast(message);
+  }
+
   async notifyError(campaignId: string, error: string): Promise<void> {
     if (!this.config.notificationSettings.campaignError) return;
 
-    const message = `
-⚠️ *Campaign Error*
+    const message = `⚠️ *Campaign Error*
 
-Campaign: \`${campaignId}\`
-Error: ${error}
-    `.trim();
-
-    await this.broadcast(message);
-  }
-
-  /**
-   * Send daily report
-   */
-  async sendDailyReport(): Promise<void> {
-    if (!this.config.notificationSettings.dailyReport) return;
-
-    // Mock daily report
-    const report = {
-      totalVolume: 381.5,
-      totalTransactions: 1024,
-      activeCampaigns: 3,
-      totalSpent: 25.2,
-      errors: 2
-    };
-
-    const message = `
-📊 *Daily Report*
-
-*Summary:*
-- Total Volume: ${report.totalVolume} SOL
-- Transactions: ${report.totalTransactions}
-- Active Campaigns: ${report.activeCampaigns}
-- Total Spent: ${report.totalSpent} SOL
-- Errors: ${report.errors}
-
-*Status:* All systems operational ✅
-    `.trim();
+*Campaign:* \`${campaignId}\`
+*Error:* ${error}`;
 
     await this.broadcast(message);
   }
@@ -459,14 +561,12 @@ Error: ${error}
   /**
    * Make API call to Telegram
    */
-  private async apiCall(method: string, params: Record<string, any>): Promise<any> {
+  private async apiCall(method: string, params: Record<string, any> = {}): Promise<any> {
     const url = `https://api.telegram.org/bot${this.token}/${method}`;
     
     const response = await fetch(url, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json'
-      },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(params)
     });
 
@@ -476,11 +576,17 @@ Error: ${error}
 
     return response.json();
   }
+
+  /**
+   * Sleep utility
+   */
+  private sleep(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
 }
 
-// Export for use
 export { TelegramBot };
-export default TelegramBot;
+export type { TelegramBotConfig };
 
 // CLI entry point
 if (require.main === module) {
@@ -492,11 +598,18 @@ if (require.main === module) {
     process.exit(1);
   }
 
+  const allowedChatIds = process.env.TELEGRAM_ALLOWED_CHAT_IDS
+    ? process.env.TELEGRAM_ALLOWED_CHAT_IDS.split(',').map(Number)
+    : undefined;
+
   const bot = new TelegramBot({
     token,
+    allowedChatIds,
     notificationSettings: {
       campaignStarted: true,
       campaignStopped: true,
+      campaignPaused: true,
+      campaignResumed: true,
       campaignError: true,
       walletFunded: true,
       dailyReport: true

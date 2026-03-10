@@ -3,49 +3,34 @@
 /**
  * SVBB CLI - Command Line Interface for Solana Volume Booster Bot
  * 
- * Usage:
- *   svbb campaign create <tokenMint> <strategy> <budget>
- *   svbb campaign start <campaignId>
- *   svbb campaign stop <campaignId>
- *   svbb campaign pause <campaignId>
- *   svbb campaign resume <campaignId>
- *   svbb campaign status <campaignId>
- *   svbb wallet list
- *   svbb wallet fund <walletAddress> <amount>
- *   svbb wallet recover <walletAddress>
+ * Production-ready CLI for managing campaigns and wallets
  */
 
-import { createInterface } from 'readline';
 import { 
-  createCampaign, 
-  startCampaign, 
-  pauseCampaign, 
-  stopCampaign, 
-  getCampaign, 
-  getAllCampaigns 
+  createCampaign,
+  startCampaign,
+  pauseCampaign,
+  resumeCampaign,
+  stopCampaign,
+  getCampaign,
+  getAllCampaigns,
+  STRATEGY_CONFIGS
 } from '../lib/campaign';
-import { 
-  generateKeypair, 
-  getAllWallets, 
+import {
+  generateKeypair,
+  getAllWallets,
   getBurnerWalletsByStatus,
-  fundBurnerWallet,
-  recoverBurnerFunds,
-  addBurnerWallet,
-  deleteWallet 
+  createBurnerWallet,
+  deleteWallet,
+  getMasterWallet,
+  setMasterWallet,
+  type MasterWallet,
+  type BurnerWallet
 } from '../lib/wallet';
+import type { Campaign, CampaignStrategy, WalletStatus } from '../src/types';
 
 const args = process.argv.slice(2);
 const command = args[0];
-
-interface CLICommands {
-  campaign: string[];
-  wallet: string[];
-}
-
-const availableCommands: CLICommands = {
-  campaign: ['create', 'start', 'stop', 'pause', 'resume', 'status', 'list'],
-  wallet: ['list', 'fund', 'recover', 'add', 'remove']
-};
 
 function printUsage(): void {
   console.log(`
@@ -59,7 +44,7 @@ Modules:
   wallet      Manage burner wallets
 
 Campaign Commands:
-  create <tokenMint> <strategy> <budget>  Create a new campaign
+  create <name> <tokenMint> <strategy> <budget>  Create a new campaign
   start <campaignId>                       Start a campaign
   stop <campaignId>                        Stop a campaign
   pause <campaignId>                        Pause a campaign
@@ -68,19 +53,18 @@ Campaign Commands:
   list                                     List all campaigns
 
 Wallet Commands:
-  list                                      List all burner wallets
-  fund <address> <amount>                  Fund a burner wallet
-  recover <address>                        Recover funds from burner
-  add                                       Generate new burner wallet
-  remove <address>                          Remove a burner wallet
+  list                                      List all wallets
+  list-active                               List active wallets
+  list-cooling                              List cooling wallets
+  generate                                  Generate new burner wallet
+  remove <walletId>                         Remove a wallet
 
 Examples:
-  svbb campaign create JUPyiwrYJFskUPiHa7hkeR8VUtkqjberbSOWd91pbT2a drip 10
+  svbb campaign create "My Campaign" JUPyiwrYJFskUPiHa7hkeR8VUtkqjberbSOWd91pbT2a drip 10
   svbb campaign start campaign_123
   svbb campaign status campaign_123
   svbb wallet list
-
-For more information, visit: https://github.com/svbb/docs
+  svbb wallet generate
 `);
 }
 
@@ -92,211 +76,253 @@ function validateArgs(required: number, provided: number, command: string): bool
   return true;
 }
 
-async function handleCampaignCommand(cmd: string, args: string[]): Promise<void> {
-  const campaignManager = new CampaignManager();
-  
-  switch (cmd) {
-    case 'create':
-      if (!validateArgs(3, args.length, 'campaign create')) return;
-      await handleCampaignCreate(campaignManager, args[0], args[1], parseFloat(args[2]));
-      break;
-      
-    case 'start':
-      if (!validateArgs(1, args.length, 'campaign start')) return;
-      await handleCampaignStart(campaignManager, args[0]);
-      break;
-      
-    case 'stop':
-      if (!validateArgs(1, args.length, 'campaign stop')) return;
-      await handleCampaignStop(campaignManager, args[0]);
-      break;
-      
-    case 'pause':
-      if (!validateArgs(1, args.length, 'campaign pause')) return;
-      await handleCampaignPause(campaignManager, args[0]);
-      break;
-      
-    case 'resume':
-      if (!validateArgs(1, args.length, 'campaign resume')) return;
-      await handleCampaignResume(campaignManager, args[0]);
-      break;
-      
-    case 'status':
-      if (!validateArgs(1, args.length, 'campaign status')) return;
-      await handleCampaignStatus(campaignManager, args[0]);
-      break;
-      
-    case 'list':
-      await handleCampaignList(campaignManager);
-      break;
-      
-    default:
-      console.error(`Unknown campaign command: ${cmd}`);
-      console.log('Run "svbb campaign --help" for usage information');
-  }
-}
-
-async function handleWalletCommand(cmd: string, args: string[]): Promise<void> {
-  const walletManager = new WalletManager();
-  
-  switch (cmd) {
-    case 'list':
-      await handleWalletList(walletManager);
-      break;
-      
-    case 'fund':
-      if (!validateArgs(2, args.length, 'wallet fund')) return;
-      await handleWalletFund(walletManager, args[0], parseFloat(args[1]));
-      break;
-      
-    case 'recover':
-      if (!validateArgs(1, args.length, 'wallet recover')) return;
-      await handleWalletRecover(walletManager, args[0]);
-      break;
-      
-    case 'add':
-      await handleWalletAdd(walletManager);
-      break;
-      
-    case 'remove':
-      if (!validateArgs(1, args.length, 'wallet remove')) return;
-      await handleWalletRemove(walletManager, args[0]);
-      break;
-      
-    default:
-      console.error(`Unknown wallet command: ${cmd}`);
-      console.log('Run "svbb wallet --help" for usage information');
-  }
-}
-
-// Campaign handlers
-async function handleCampaignCreate(
-  manager: CampaignManager,
-  tokenMint: string,
-  strategy: string,
-  budget: number
-): Promise<void> {
-  console.log(`Creating campaign for token: ${tokenMint}`);
-  console.log(`Strategy: ${strategy}`);
-  console.log(`Budget: ${budget} SOL`);
-  
-  // In production, this would create the campaign via the API
-  const campaignId = `campaign_${Date.now()}`;
-  console.log(`\n✅ Campaign created successfully!`);
-  console.log(`Campaign ID: ${campaignId}`);
-  console.log(`\nTo start the campaign, run:`);
-  console.log(`  svbb campaign start ${campaignId}`);
-}
-
-async function handleCampaignStart(manager: CampaignManager, campaignId: string): Promise<void> {
-  console.log(`Starting campaign: ${campaignId}`);
-  console.log('✅ Campaign started successfully!');
-}
-
-async function handleCampaignStop(manager: CampaignManager, campaignId: string): Promise<void> {
-  console.log(`Stopping campaign: ${campaignId}`);
-  console.log('🛑 Campaign stopped successfully!');
-}
-
-async function handleCampaignPause(manager: CampaignManager, campaignId: string): Promise<void> {
-  console.log(`Pausing campaign: ${campaignId}`);
-  console.log('⏸️ Campaign paused successfully!');
-}
-
-async function handleCampaignResume(manager: CampaignManager, campaignId: string): Promise<void> {
-  console.log(`Resuming campaign: ${campaignId}`);
-  console.log('▶️ Campaign resumed successfully!');
-}
-
-async function handleCampaignStatus(manager: CampaignManager, campaignId: string): Promise<void> {
-  console.log(`Fetching status for campaign: ${campaignId}\n`);
-  
-  // Mock status output
-  const status = {
-    id: campaignId,
-    status: 'active',
-    volumeGenerated: 125.5,
-    transactions: 342,
-    makers: 15,
-    buyRatio: 0.62,
-    spent: 8.5,
-    startedAt: new Date(Date.now() - 86400000).toISOString()
-  };
-  
-  console.log(`Status: ${status.status.toUpperCase()}`);
-  console.log(`Volume Generated: ${status.volumeGenerated} SOL`);
-  console.log(`Transactions: ${status.transactions}`);
-  console.log(`Active Makers: ${status.makers}`);
-  console.log(`Buy/Sell Ratio: ${(status.buyRatio * 100).toFixed(0)}% / ${((1 - status.buyRatio) * 100).toFixed(0)}%`);
-  console.log(`Spent: ${status.spent} SOL`);
-  console.log(`Started: ${status.startedAt}`);
-}
-
-async function handleCampaignList(manager: CampaignManager): Promise<void> {
-  console.log('Fetching campaigns...\n');
-  
-  // Mock campaigns list
-  const campaigns = [
-    { id: 'campaign_001', token: 'JUPyiwrYJFskUPiHa7hkeR8VUtkqjberbSOWd91pbT2a', status: 'active', volume: 125.5 },
-    { id: 'campaign_002', token: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', status: 'paused', volume: 45.2 },
-    { id: 'campaign_003', token: 'mSoLzYCxHdYgdzU16g5QSh3i5K3z3EzZKfpfw5LoUgca', status: 'stopped', volume: 210.8 }
-  ];
-  
-  console.log('ID            | Token                                    | Status   | Volume (SOL)');
-  console.log('--------------|------------------------------------------|----------|--------------');
+function formatCampaignTable(campaigns: Campaign[]): void {
+  console.log('\nID            | Name                    | Token                         | Status   | Volume    | Spent');
+  console.log('--------------|-------------------------|-------------------------------|----------|-----------|-------');
   
   campaigns.forEach(c => {
+    const name = c.name.substring(0, 24).padEnd(24);
+    const token = c.tokenMint.substring(0, 29).padEnd(29);
+    const volume = c.metrics.volume.toFixed(2).padEnd(9);
+    const spent = c.budget.spent.toFixed(2);
+    
     console.log(
-      `${c.id.padEnd(14)}| ${c.token.substring(0, 40).padEnd(40)}| ${c.status.padEnd(8)}| ${c.volume.toFixed(1).padEnd(12)}`
+      `${c.id.substring(0, 14).padEnd(14)}| ${name}| ${token}| ${c.status.padEnd(10)}| ${volume}| ${spent}`
     );
   });
   
   console.log(`\nTotal: ${campaigns.length} campaigns`);
 }
 
-// Wallet handlers
-async function handleWalletList(manager: WalletManager): Promise<void> {
-  console.log('Fetching wallets...\n');
-  
-  // Mock wallets list
-  const wallets = [
-    { address: '7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU', balance: 2.5, status: 'active' },
-    { address: ' GK2w4MNzqX8K5wZ4dKr6LQvN5YqZ5K5wZ4dKr6LQvN5Y', balance: 1.8, status: 'active' },
-    { address: ' Hz4vZuC1KpK4t4Z4dKr6LQvN5YqZ5K5wZ4dKr6LQvN5Y', balance: 0.0, status: 'cooling' }
-  ];
-  
-  console.log('Address                                      | Balance  | Status   ');
-  console.log('---------------------------------------------|----------|----------');
+function formatWalletTable(wallets: (MasterWallet | BurnerWallet)[]): void {
+  console.log('\nID                                    | Address                         | Status   | Balance  | Tx Count');
+  console.log('--------------------------------------|---------------------------------|----------|----------|----------');
   
   wallets.forEach(w => {
+    const id = w.id.substring(0, 38).padEnd(38);
+    const address = w.address.substring(0, 33).padEnd(33);
+    const balance = w.balance.toFixed(4).padEnd(8);
+    const txCount = (w as BurnerWallet).transactionCount?.toString().padEnd(8) || '0'.padEnd(8);
+    
     console.log(
-      `${w.address.substring(0, 46).padEnd(46)}| ${w.balance.toFixed(2).padEnd(8)}| ${w.status}`
+      `${id}| ${address}| ${w.status.padEnd(8)}| ${balance}| ${txCount}`
     );
   });
   
   console.log(`\nTotal: ${wallets.length} wallets`);
 }
 
-async function handleWalletFund(manager: WalletManager, address: string, amount: number): Promise<void> {
-  console.log(`Funding wallet: ${address}`);
-  console.log(`Amount: ${amount} SOL`);
-  console.log('✅ Wallet funded successfully!');
+// Campaign handlers
+async function handleCampaignCreate(
+  name: string,
+  tokenMint: string,
+  strategy: string,
+  budget: number
+): Promise<void> {
+  // Validate strategy
+  const validStrategies: CampaignStrategy[] = ['drip', 'burst', 'volume_only', 'market_maker'];
+  if (!validStrategies.includes(strategy as CampaignStrategy)) {
+    console.error(`Error: Invalid strategy "${strategy}"`);
+    console.log(`Valid strategies: ${validStrategies.join(', ')}`);
+    return;
+  }
+  
+  console.log(`Creating campaign for token: ${tokenMint}`);
+  console.log(`Strategy: ${strategy}`);
+  console.log(`Budget: ${budget} SOL\n`);
+  
+  try {
+    const campaign = await createCampaign(
+      name,
+      tokenMint,
+      strategy as CampaignStrategy,
+      {},
+      { total: budget }
+    );
+    
+    console.log(`✅ Campaign created successfully!`);
+    console.log(`Campaign ID: ${campaign.id}`);
+    console.log(`Name: ${campaign.name}`);
+    console.log(`Token: ${campaign.tokenMint}`);
+    console.log(`Strategy: ${campaign.strategy}`);
+    console.log(`Status: ${campaign.status}`);
+    console.log(`Budget: ${campaign.budget.total} SOL`);
+    console.log(`\nTo start the campaign, run:`);
+    console.log(`  svbb campaign start ${campaign.id}`);
+  } catch (error) {
+    console.error('Failed to create campaign:', error);
+  }
 }
 
-async function handleWalletRecover(manager: WalletManager, address: string): Promise<void> {
-  console.log(`Recovering funds from wallet: ${address}`);
-  console.log('✅ Funds recovered successfully!');
+async function handleCampaignStart(campaignId: string): Promise<void> {
+  try {
+    const success = await startCampaign(campaignId);
+    if (success) {
+      console.log(`✅ Campaign ${campaignId} started successfully!`);
+    } else {
+      console.error(`Failed to start campaign. Check if campaign exists and is in correct state.`);
+    }
+  } catch (error) {
+    console.error('Error starting campaign:', error);
+  }
 }
 
-async function handleWalletAdd(manager: WalletManager): Promise<void> {
-  console.log('Generating new burner wallet...');
-  const newAddress = 'NewWallet' + Math.random().toString(36).substring(7);
-  console.log(`✅ New wallet added: ${newAddress}`);
+function handleCampaignStop(campaignId: string): void {
+  try {
+    const success = stopCampaign(campaignId);
+    if (success) {
+      console.log(`🛑 Campaign ${campaignId} stopped successfully!`);
+    } else {
+      console.error(`Failed to stop campaign. Check if campaign exists and is running.`);
+    }
+  } catch (error) {
+    console.error('Error stopping campaign:', error);
+  }
 }
 
-async function handleWalletRemove(manager: WalletManager, address: string): Promise<void> {
-  console.log(`Removing wallet: ${address}`);
-  console.log('✅ Wallet removed successfully!');
+function handleCampaignPause(campaignId: string): void {
+  try {
+    const success = pauseCampaign(campaignId);
+    if (success) {
+      console.log(`⏸️ Campaign ${campaignId} paused successfully!`);
+    } else {
+      console.error(`Failed to pause campaign. Check if campaign exists and is running.`);
+    }
+  } catch (error) {
+    console.error('Error pausing campaign:', error);
+  }
+}
+
+async function handleCampaignResume(campaignId: string): Promise<void> {
+  try {
+    const success = await resumeCampaign(campaignId);
+    if (success) {
+      console.log(`▶️ Campaign ${campaignId} resumed successfully!`);
+    } else {
+      console.error(`Failed to resume campaign. Check if campaign exists and is paused.`);
+    }
+  } catch (error) {
+    console.error('Error resuming campaign:', error);
+  }
+}
+
+function handleCampaignStatus(campaignId: string): void {
+  const campaign = getCampaign(campaignId);
+  
+  if (!campaign) {
+    console.error(`Campaign not found: ${campaignId}`);
+    return;
+  }
+  
+  console.log(`\n📊 Campaign Status: ${campaign.name}`);
+  console.log('─'.repeat(50));
+  console.log(`ID:         ${campaign.id}`);
+  console.log(`Token:      ${campaign.tokenMint}`);
+  console.log(`Strategy:   ${campaign.strategy}`);
+  console.log(`Status:     ${campaign.status.toUpperCase()}`);
+  console.log(`\n💰 Budget:`);
+  console.log(`  Total:    ${campaign.budget.total} SOL`);
+  console.log(`  Daily:    ${campaign.budget.daily} SOL`);
+  console.log(`  Per Hour: ${campaign.budget.perHour} SOL`);
+  console.log(`  Spent:    ${campaign.budget.spent} SOL`);
+  console.log(`\n📈 Metrics:`);
+  console.log(`  Volume:           ${campaign.metrics.volume.toFixed(4)} SOL`);
+  console.log(`  Transactions:     ${campaign.metrics.transactionCount}`);
+  console.log(`  Active Makers:     ${campaign.metrics.makerCount}`);
+  console.log(`  Buy Count:        ${campaign.metrics.buyCount}`);
+  console.log(`  Sell Count:      ${campaign.metrics.sellCount}`);
+  console.log(`  Total Fees:       ${campaign.metrics.totalFees.toFixed(6)} SOL`);
+  console.log(`  Avg Price Impact: ${campaign.metrics.averagePriceImpact.toFixed(2)}%`);
+  
+  const buyRatio = campaign.metrics.buyCount + campaign.metrics.sellCount > 0 
+    ? campaign.metrics.buyCount / (campaign.metrics.buyCount + campaign.metrics.sellCount) 
+    : 0;
+  console.log(`  Buy/Sell Ratio:   ${(buyRatio * 100).toFixed(0)}% / ${((1 - buyRatio) * 100).toFixed(0)}%`);
+  
+  console.log(`\n⏰ Timeline:`);
+  if (campaign.createdAt) {
+    console.log(`  Created: ${campaign.createdAt.toISOString()}`);
+  }
+  if (campaign.startedAt) {
+    console.log(`  Started: ${campaign.startedAt.toISOString()}`);
+  }
+  if (campaign.updatedAt) {
+    console.log(`  Updated: ${campaign.updatedAt.toISOString()}`);
+  }
+}
+
+function handleCampaignList(): void {
+  const campaigns = getAllCampaigns();
+  
+  if (campaigns.length === 0) {
+    console.log('No campaigns found. Create one with:');
+    console.log('  svbb campaign create <name> <token> <strategy> <budget>');
+    return;
+  }
+  
+  console.log(`\n📋 Found ${campaigns.length} campaign(s):`);
+  formatCampaignTable(campaigns);
+}
+
+// Wallet handlers
+function handleWalletList(): void {
+  const wallets = getAllWallets();
+  
+  if (wallets.length === 0) {
+    console.log('No wallets found.');
+    return;
+  }
+  
+  console.log(`\n📋 Found ${wallets.length} wallet(s):`);
+  formatWalletTable(wallets);
+}
+
+function handleWalletListByStatus(status: WalletStatus): void {
+  const wallets = getBurnerWalletsByStatus(status);
+  
+  if (wallets.length === 0) {
+    console.log(`No wallets with status: ${status}`);
+    return;
+  }
+  
+  console.log(`\n📋 Found ${wallets.length} wallet(s) with status "${status}":`);
+  formatWalletTable(wallets);
+}
+
+async function handleWalletGenerate(): Promise<void> {
+  try {
+    const wallet = await createBurnerWallet();
+    console.log(`✅ New burner wallet generated!`);
+    console.log(`Wallet ID:  ${wallet.id}`);
+    console.log(`Address:    ${wallet.address}`);
+    console.log(`Status:     ${wallet.status}`);
+    console.log(`Balance:    ${wallet.balance} SOL`);
+  } catch (error) {
+    console.error('Error generating wallet:', error);
+  }
+}
+
+function handleWalletRemove(walletId: string): void {
+  const success = deleteWallet(walletId);
+  if (success) {
+    console.log(`✅ Wallet ${walletId} removed successfully!`);
+  } else {
+    console.error(`Failed to remove wallet. Check if wallet exists.`);
+  }
+}
+
+function handleMasterWallet(): void {
+  const master = getMasterWallet();
+  
+  if (!master) {
+    console.log('No master wallet configured.');
+    console.log('Set it up via the web dashboard or API.');
+    return;
+  }
+  
+  console.log(`\n👤 Master Wallet:`);
+  console.log(`  Address: ${master.address}`);
+  console.log(`  Balance: ${master.balance} SOL`);
 }
 
 // Main execution
@@ -304,23 +330,6 @@ async function main(): Promise<void> {
   // Show help if no command
   if (!command || command === '--help' || command === '-h') {
     printUsage();
-    process.exit(0);
-  }
-  
-  // Handle module-level help
-  if (command === 'campaign' && (args[1] === '--help' || args[1] === '-h')) {
-    console.log('Campaign Commands:');
-    availableCommands.campaign.forEach(cmd => {
-      console.log(`  ${cmd}`);
-    });
-    process.exit(0);
-  }
-  
-  if (command === 'wallet' && (args[1] === '--help' || args[1] === '-h')) {
-    console.log('Wallet Commands:');
-    availableCommands.wallet.forEach(cmd => {
-      console.log(`  ${cmd}`);
-    });
     process.exit(0);
   }
   
@@ -334,23 +343,97 @@ async function main(): Promise<void> {
   const cmd = args[1];
   
   if (command === 'campaign') {
-    if (!cmd || !availableCommands.campaign.includes(cmd)) {
-      console.error(`Error: Unknown campaign command "${cmd}"`);
+    if (!cmd) {
+      console.error('Error: Please specify a campaign command');
       console.log('Run "svbb campaign --help" for available commands');
       process.exit(1);
     }
-    await handleCampaignCommand(cmd, args.slice(2));
+    
+    switch (cmd) {
+      case 'create':
+        if (!validateArgs(4, args.length - 2, 'campaign create')) {
+          printUsage();
+          process.exit(1);
+        }
+        await handleCampaignCreate(args[2], args[3], args[4], parseFloat(args[5]));
+        break;
+        
+      case 'start':
+        if (!validateArgs(1, args.length - 2, 'campaign start')) process.exit(1);
+        await handleCampaignStart(args[2]);
+        break;
+        
+      case 'stop':
+        if (!validateArgs(1, args.length - 2, 'campaign stop')) process.exit(1);
+        handleCampaignStop(args[2]);
+        break;
+        
+      case 'pause':
+        if (!validateArgs(1, args.length - 2, 'campaign pause')) process.exit(1);
+        handleCampaignPause(args[2]);
+        break;
+        
+      case 'resume':
+        if (!validateArgs(1, args.length - 2, 'campaign resume')) process.exit(1);
+        await handleCampaignResume(args[2]);
+        break;
+        
+      case 'status':
+        if (!validateArgs(1, args.length - 2, 'campaign status')) process.exit(1);
+        handleCampaignStatus(args[2]);
+        break;
+        
+      case 'list':
+        handleCampaignList();
+        break;
+        
+      default:
+        console.error(`Unknown campaign command: ${cmd}`);
+        console.log('Run "svbb --help" for usage information');
+        process.exit(1);
+    }
   } else if (command === 'wallet') {
-    if (!cmd || !availableCommands.wallet.includes(cmd)) {
-      console.error(`Error: Unknown wallet command "${cmd}"`);
+    if (!cmd) {
+      console.error('Error: Please specify a wallet command');
       console.log('Run "svbb wallet --help" for available commands');
       process.exit(1);
     }
-    await handleWalletCommand(cmd, args.slice(2));
+    
+    switch (cmd) {
+      case 'list':
+        handleWalletList();
+        break;
+        
+      case 'list-active':
+        handleWalletListByStatus('active');
+        break;
+        
+      case 'list-cooling':
+        handleWalletListByStatus('cooling');
+        break;
+        
+      case 'generate':
+        await handleWalletGenerate();
+        break;
+        
+      case 'remove':
+        if (!validateArgs(1, args.length - 2, 'wallet remove')) process.exit(1);
+        handleWalletRemove(args[2]);
+        break;
+        
+      case 'master':
+        handleMasterWallet();
+        break;
+        
+      default:
+        console.error(`Unknown wallet command: ${cmd}`);
+        console.log('Run "svbb --help" for usage information');
+        process.exit(1);
+    }
   }
 }
 
 main().catch(error => {
-  console.error('Error:', error.message);
+  console.error('Error:', error);
   process.exit(1);
 });

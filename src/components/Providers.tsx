@@ -61,13 +61,10 @@ const WalletConnectionProvider = ({ children }: { children: ReactNode }) => {
 
   const endpoint = clusterApiUrl('mainnet-beta');
 
-  if (!isMounted) {
-    return <>{children}</>;
-  }
-
+  // Always render providers - the wallet adapter handles SSR gracefully
   return (
     <ConnectionProvider endpoint={endpoint}>
-      <WalletProvider wallets={wallets} autoConnect>
+      <WalletProvider wallets={wallets} autoConnect={isMounted}>
         <WalletModalProvider>
           {children}
         </WalletModalProvider>

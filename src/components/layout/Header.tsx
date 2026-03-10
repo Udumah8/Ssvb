@@ -14,7 +14,16 @@ const navigation = [
 
 export default function Header() {
   const pathname = usePathname();
-  const { connected } = useWallet();
+  
+  // Handle case when wallet context is not available (SSR)
+  let connected = false;
+  try {
+    const wallet = useWallet();
+    connected = wallet?.connected ?? false;
+  } catch {
+    // Wallet context not available during SSR
+    connected = false;
+  }
 
   return (
     <header className="bg-slate-900 border-b border-slate-800">

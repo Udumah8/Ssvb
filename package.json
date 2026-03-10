@@ -7,7 +7,9 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "cli": "bun run src/bin/cli.ts",
+    "telegram": "bun run src/bin/telegram-bot.ts"
   },
   "dependencies": {
     "@solana/wallet-adapter-base": "^0.9.27",

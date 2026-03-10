@@ -125,3 +125,4 @@ All 8 phases of development are complete. The project is ready for production de
 | March 10, 2026 | Created docs/requirements.md, docs/plan.md, docs/tasks.md |
 | March 10, 2026 | Implemented Phase 1 core modules |
 | March 10, 2026 | Implemented Phase 2 Web UI (Dashboard, Campaigns, Wallets, Settings) |
+| March 10, 2026 | Implemented CLI (src/bin/cli.ts), Telegram Bot (src/bin/telegram-bot.ts), README.md, added npm scripts
